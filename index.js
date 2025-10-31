@@ -1,4 +1,4 @@
-// index.js — Discord bot for RLBR Lift Logger (with fast autocomplete)
+// index.js — Discord bot for RLBR Lift Logger (fast autocomplete + fallback)
 
 import 'dotenv/config';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
@@ -19,14 +19,30 @@ async function appPost(fn, body) {
   return await res.json();
 }
 
+/* --------- fallback (always available) exercise list --------- */
+const FALLBACK_EXERCISES = [
+  'Barbell Bench Press','Barbell Incline Bench Press','Dumbbell Bench Press','Dumbbell Incline Bench Press',
+  'Machine Chest Press','Smith Machine Bench Press','Barbell Overhead Press','Seated Dumbbell Overhead Press',
+  'Cable Chest Fly','Pec Deck Fly','Triceps Rope Pushdown','Triceps Single-Arm Cable Overhead Extension',
+  'Triceps Single-Arm Rope Pushdown','Chest-Supported Row','Close-Grip Seated Cable Row',
+  'Wide-Grip Seated Cable Row','Lat Pulldown','Dumbbell Hammer Curl','Cable Hammer Curl','Reverse Curls',
+  'Behind-the-Back Barbell Wrist Curls','Barbell Curl','Bayesian Cable Curl','EZ Bar Curl','Single-Arm Preacher Curl',
+  'Seated Dumbbell Curl','Back Squat','Smith Machine Squat','Hack Squat','Leg Press','Barbell Romanian Deadlifts',
+  'Seated Leg Curl','Leg Extension','Hip Abduction','Hip Adduction','Standing Calf Raise',
+  'Cable Lateral Raises','Cable Rear Delt Fly','Low Row Machine','Shrugs','Ab Crunch Machine',
+  'Weighted Back Extensions','Forward Neck Crunch','Neck Extension','Lateral Neck Crunch'
+];
+
 /* -------------- exercise cache for autocomplete ---------- */
 let EXERCISE_CACHE = { names: [], fetchedAt: 0 };
 
 function getCachedExercises() {
-  return EXERCISE_CACHE.names || [];
+  // prefer live cache; otherwise fallback list
+  return (EXERCISE_CACHE.names && EXERCISE_CACHE.names.length)
+    ? EXERCISE_CACHE.names
+    : FALLBACK_EXERCISES;
 }
 
-// fetch with hard timeout so autocomplete never hangs
 async function fetchWithTimeout(promise, ms = 1500) {
   return Promise.race([
     promise,
@@ -38,9 +54,14 @@ async function refreshExercises() {
   try {
     const out = await fetchWithTimeout(appPost('list_exercises', {}), 1500);
     const list = (out && out.ok && Array.isArray(out.exercises)) ? out.exercises : [];
-    if (list.length) EXERCISE_CACHE = { names: list, fetchedAt: Date.now() };
-  } catch {
-    // keep old cache on timeout/network hiccup
+    if (list.length) {
+      EXERCISE_CACHE = { names: list, fetchedAt: Date.now() };
+      console.log(`[cache] loaded ${list.length} exercises from Sheets`);
+    } else {
+      console.log('[cache] Sheets returned empty list; keeping current cache');
+    }
+  } catch (e) {
+    console.log('[cache] refresh timed out/failed; using fallback or current cache');
   }
 }
 
@@ -50,35 +71,18 @@ const commands = [
     .setName('session_start')
     .setDescription('Start a session (optional: paste GPT BOT_MESSAGE)')
     .addStringOption(o =>
-      o.setName('plan')
-       .setDescription('Paste BOT_MESSAGE block')
-       .setRequired(false)
+      o.setName('plan').setDescription('Paste BOT_MESSAGE block').setRequired(false)
     ),
 
   new SlashCommandBuilder()
     .setName('log')
     .setDescription('Log a set')
     .addStringOption(o =>
-      o.setName('exercise')
-       .setDescription('Exercise')
-       .setRequired(true)
-       .setAutocomplete(true)
+      o.setName('exercise').setDescription('Exercise').setRequired(true).setAutocomplete(true)
     )
-    .addNumberOption(o =>
-      o.setName('weight')
-       .setDescription('Weight')
-       .setRequired(true)
-    )
-    .addIntegerOption(o =>
-      o.setName('reps')
-       .setDescription('Reps')
-       .setRequired(true)
-    )
-    .addStringOption(o =>
-      o.setName('notes')
-       .setDescription('Notes')
-       .setRequired(false)
-    ),
+    .addNumberOption(o => o.setName('weight').setDescription('Weight').setRequired(true))
+    .addIntegerOption(o => o.setName('reps').setDescription('Reps').setRequired(true))
+    .addStringOption(o => o.setName('notes').setDescription('Notes').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('session_end')
@@ -90,9 +94,9 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const sessionKey = id => `sid:${id}`;
 
 client.once('ready', async () => {
-  // Pre-warm the exercise cache and refresh every 5 min (non-blocking)
+  // Pre-warm: try Sheets, else fallback list is already there
   await refreshExercises();
-  setInterval(refreshExercises, 5 * 60 * 1000);
+  setInterval(refreshExercises, 5 * 60 * 1000); // background refresh
 
   // Register slash commands
   const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -113,20 +117,16 @@ client.on('interactionCreate', async (i) => {
     /* ---------- Autocomplete for /log exercise ---------- */
     if (i.isAutocomplete()) {
       if (i.commandName === 'log') {
-        const focused = i.options.getFocused(true); // { name, value }
+        const focused = i.options.getFocused(true);
         if (focused.name === 'exercise') {
           const q = (focused.value || '').toLowerCase();
           const all = getCachedExercises();
 
-          // If cache is empty, kick off a refresh in the background
-          if (!all.length) refreshExercises();
-
           // rank suggestions: startsWith first, then contains
           const starts   = all.filter(n => n.toLowerCase().startsWith(q));
           const contains = all.filter(n => !n.toLowerCase().startsWith(q) && n.toLowerCase().includes(q));
-          const picks    = [...starts, ...contains].slice(0, 25);
+          const picks    = (q ? [...starts, ...contains] : all).slice(0, 25);
 
-          // Always respond within ~3s even if empty (Discord requirement)
           return i.respond(picks.map(name => ({ name, value: name })));
         }
       }
@@ -186,8 +186,7 @@ client.on('interactionCreate', async (i) => {
 
   } catch (err) {
     console.error(err);
-    // Don’t try to editReply for autocomplete
-    if (i.isAutocomplete && i.isAutocomplete()) return;
+    if (i.isAutocomplete && i.isAutocomplete()) return; // don’t editReply for autocomplete
     if (i.deferred) return i.editReply(`❌ Error: ${String(err)}`);
     return i.reply({ content: `❌ Error: ${String(err)}`, ephemeral: true });
   }
