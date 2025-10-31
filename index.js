@@ -2,22 +2,27 @@ import 'dotenv/config';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const APP_URL = process.env.APP_URL;       // Google Apps Script Web App URL
-const APP_SECRET = process.env.APP_SECRET; // the SECRET you set in Apps Script
-const GUILD_ID = process.env.GUILD_ID || ''; // optional: your server ID for instant commands
+const APP_URL = process.env.APP_URL;       // Apps Script Web App URL (/exec)
+const APP_SECRET = process.env.APP_SECRET; // same SECRET as in Apps Script
+const GUILD_ID = process.env.GUILD_ID || ''; // optional: server ID for instant cmds
 
-async function appPost(fn, body){
+async function appPost(fn, body) {
   const url = `${APP_URL}?fn=${encodeURIComponent(fn)}&secret=${encodeURIComponent(APP_SECRET)}`;
-  const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{}) });
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {})
+  });
   return await res.json();
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+/* ------- exercise list cache for autocomplete ------- */
 let EXERCISE_CACHE = { names: [], fetchedAt: 0 };
-async function getExercises(){
+async function getExercises() {
   const now = Date.now();
-  if (EXERCISE_CACHE.names.length && (now - EXERCISE_CACHE.fetchedAt) < 5*60*1000) { // 5 min cache
+  if (EXERCISE_CACHE.names.length && (now - EXERCISE_CACHE.fetchedAt) < 5 * 60 * 1000) {
     return EXERCISE_CACHE.names;
   }
   const out = await appPost('list_exercises', {});
@@ -26,33 +31,51 @@ async function getExercises(){
   return list;
 }
 
+/* ----------------- slash commands ------------------ */
 const commands = [
   new SlashCommandBuilder()
     .setName('session_start')
     .setDescription('Start a session (optional: paste GPT BOT_MESSAGE)')
-    .addStringOption(o=>o.setName('plan').setDescription('Paste BOT_MESSAGE block').setRequired(false)),
-  
-new SlashCommandBuilder()
-  .setName('log')
-  .setDescription('Log a set')
-  .addStringOption(o =>
-    o.setName('exercise')
-     .setDescription('Exercise')
-     .setRequired(true)
-     .setAutocomplete(true)   // ← add this
-  )
-  .addNumberOption(/* weight ... */)
-  .addIntegerOption(/* reps ... */)
-  .addStringOption(/* notes ... */)
+    .addStringOption(o =>
+      o.setName('plan')
+        .setDescription('Paste BOT_MESSAGE block')
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('log')
+    .setDescription('Log a set')
+    .addStringOption(o =>
+      o.setName('exercise')
+        .setDescription('Exercise')
+        .setRequired(true)
+        .setAutocomplete(true)
+    )
+    .addNumberOption(o =>
+      o.setName('weight')
+        .setDescription('Weight')
+        .setRequired(true)
+    )
+    .addIntegerOption(o =>
+      o.setName('reps')
+        .setDescription('Reps')
+        .setRequired(true)
+    )
+    .addStringOption(o =>
+      o.setName('notes')
+        .setDescription('Notes')
+        .setRequired(false)
+    ),
 
   new SlashCommandBuilder()
     .setName('session_end')
     .setDescription('End session and get a SESSION_SUMMARY block')
-].map(c=>c.toJSON());
+].map(c => c.toJSON());
 
 client.once('ready', async () => {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   const appId = client.user.id;
+
   if (GUILD_ID) {
     await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), { body: commands });
     console.log('Commands registered (guild).');
@@ -63,56 +86,47 @@ client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-const sessionKey = id => `sid:${id}`;
+const sessionKey = (channelId) => `sid:${channelId}`;
 
 client.on('interactionCreate', async (i) => {
-  try{
-    if (!i.isChatInputCommand()) return;
-
-  // --- Autocomplete for /log exercise ---
+  try {
+    /* ---------- Autocomplete for /log exercise ---------- */
     if (i.isAutocomplete()) {
-      const cmd = i.commandName;
-      if (cmd === 'log') {
+      if (i.commandName === 'log') {
         const focused = i.options.getFocused(true); // { name, value }
         if (focused.name === 'exercise') {
           const q = (focused.value || '').toLowerCase();
           const all = await getExercises();
-          // rank by startsWith first, then includes; keep max 25 as Discord requires
           const starts = all.filter(n => n.toLowerCase().startsWith(q));
           const contains = all.filter(n => !n.toLowerCase().startsWith(q) && n.toLowerCase().includes(q));
           const picks = [...starts, ...contains].slice(0, 25);
           return i.respond(picks.map(name => ({ name, value: name })));
         }
       }
-      return; // don’t fall through
+      return; // handled autocomplete
     }
 
-    // ... your existing handlers for /session_start, /log, /session_end ...
+    if (!i.isChatInputCommand()) return;
 
-  } catch (err) {
-    console.error(err);
-    if (i.isAutocomplete()) return; // autocomplete must not attempt editReply
-    if (i.deferred) return i.editReply(`❌ Error: ${String(err)}`);
-    i.reply({ content:`❌ Error: ${String(err)}`, ephemeral:true });
-  }
-    
-    if (i.commandName === 'session_start'){
+    /* -------------------- /session_start -------------------- */
+    if (i.commandName === 'session_start') {
       await i.deferReply({ ephemeral: false });
       const plan = i.options.getString('plan') || '';
       const out = await appPost('session_start', { maybe_plan_text: plan });
       if (!out.ok) return i.editReply(`❌ session_start error: ${out.error}`);
       client[sessionKey(i.channelId)] = out.session_id;
 
-      const lines = (out.checklist||[]).map((c,idx)=>{
-        const tw = c.target_weight!=null? c.target_weight : '?';
-        const tr = c.target_reps!=null? c.target_reps : '?';
-        return `${idx+1}) ${c.exercise} — Target: ${tw}×${tr}`;
-      });
+      const lines = (out.checklist || []).map((c, idx) => {
+        const tw = c.target_weight != null ? c.target_weight : '?';
+        const tr = c.target_reps != null ? c.target_reps : '?';
+        return `${idx + 1}) ${c.exercise} — Target: ${tw}×${tr}`;
+        });
       const msg = lines.length ? lines.join('\n') : 'No targets yet. Log freely.';
       return i.editReply(`🟢 Session started: \`${client[sessionKey(i.channelId)]}\`\n🔥 SESSION CHECKLIST\n${msg}`);
     }
 
-    if (i.commandName === 'log'){
+    /* ------------------------ /log ------------------------- */
+    if (i.commandName === 'log') {
       await i.deferReply({ ephemeral: false });
       const sid = client[sessionKey(i.channelId)];
       if (!sid) return i.editReply('⚠️ No active session. Use /session_start first.');
@@ -124,10 +138,11 @@ client.on('interactionCreate', async (i) => {
       if (!out.ok) return i.editReply(`❌ log error: ${out.error}`);
       const nt = out.nextTarget || {};
       const tail = (nt.target_weight && nt.target_reps) ? ` • Next target: ${nt.target_weight}×${nt.target_reps}` : '';
-      return i.editReply(`✅ Logged: ${exercise} — ${weight}×${reps}${notes?` (${notes})`:''}${tail}`);
+      return i.editReply(`✅ Logged: ${exercise} — ${weight}×${reps}${notes ? ` (${notes})` : ''}${tail}`);
     }
 
-    if (i.commandName === 'session_end'){
+    /* -------------------- /session_end -------------------- */
+    if (i.commandName === 'session_end') {
       await i.deferReply({ ephemeral: false });
       const sid = client[sessionKey(i.channelId)];
       if (!sid) return i.editReply('⚠️ No active session. Use /session_start first.');
@@ -137,10 +152,12 @@ client.on('interactionCreate', async (i) => {
       return i.editReply("```text\n" + out.summary_text + "\n```");
     }
 
-  } catch(err){
+  } catch (err) {
     console.error(err);
+    // Don’t try to editReply for autocomplete
+    if (i.isAutocomplete && i.isAutocomplete()) return;
     if (i.deferred) return i.editReply(`❌ Error: ${String(err)}`);
-    i.reply({ content:`❌ Error: ${String(err)}`, ephemeral:true });
+    return i.reply({ content: `❌ Error: ${String(err)}`, ephemeral: true });
   }
 });
 
