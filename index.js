@@ -14,18 +14,37 @@ async function appPost(fn, body){
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+let EXERCISE_CACHE = { names: [], fetchedAt: 0 };
+async function getExercises(){
+  const now = Date.now();
+  if (EXERCISE_CACHE.names.length && (now - EXERCISE_CACHE.fetchedAt) < 5*60*1000) { // 5 min cache
+    return EXERCISE_CACHE.names;
+  }
+  const out = await appPost('list_exercises', {});
+  const list = (out.ok ? out.exercises : []) || [];
+  EXERCISE_CACHE = { names: list, fetchedAt: now };
+  return list;
+}
+
 const commands = [
   new SlashCommandBuilder()
     .setName('session_start')
     .setDescription('Start a session (optional: paste GPT BOT_MESSAGE)')
     .addStringOption(o=>o.setName('plan').setDescription('Paste BOT_MESSAGE block').setRequired(false)),
-  new SlashCommandBuilder()
-    .setName('log')
-    .setDescription('Log a set')
-    .addStringOption(o=>o.setName('exercise').setDescription('Exercise').setRequired(true))
-    .addNumberOption(o=>o.setName('weight').setDescription('Weight').setRequired(true))
-    .addIntegerOption(o=>o.setName('reps').setDescription('Reps').setRequired(true))
-    .addStringOption(o=>o.setName('notes').setDescription('Notes').setRequired(false)),
+  
+new SlashCommandBuilder()
+  .setName('log')
+  .setDescription('Log a set')
+  .addStringOption(o =>
+    o.setName('exercise')
+     .setDescription('Exercise')
+     .setRequired(true)
+     .setAutocomplete(true)   // ← add this
+  )
+  .addNumberOption(/* weight ... */)
+  .addIntegerOption(/* reps ... */)
+  .addStringOption(/* notes ... */)
+
   new SlashCommandBuilder()
     .setName('session_end')
     .setDescription('End session and get a SESSION_SUMMARY block')
@@ -50,6 +69,33 @@ client.on('interactionCreate', async (i) => {
   try{
     if (!i.isChatInputCommand()) return;
 
+  // --- Autocomplete for /log exercise ---
+    if (i.isAutocomplete()) {
+      const cmd = i.commandName;
+      if (cmd === 'log') {
+        const focused = i.options.getFocused(true); // { name, value }
+        if (focused.name === 'exercise') {
+          const q = (focused.value || '').toLowerCase();
+          const all = await getExercises();
+          // rank by startsWith first, then includes; keep max 25 as Discord requires
+          const starts = all.filter(n => n.toLowerCase().startsWith(q));
+          const contains = all.filter(n => !n.toLowerCase().startsWith(q) && n.toLowerCase().includes(q));
+          const picks = [...starts, ...contains].slice(0, 25);
+          return i.respond(picks.map(name => ({ name, value: name })));
+        }
+      }
+      return; // don’t fall through
+    }
+
+    // ... your existing handlers for /session_start, /log, /session_end ...
+
+  } catch (err) {
+    console.error(err);
+    if (i.isAutocomplete()) return; // autocomplete must not attempt editReply
+    if (i.deferred) return i.editReply(`❌ Error: ${String(err)}`);
+    i.reply({ content:`❌ Error: ${String(err)}`, ephemeral:true });
+  }
+    
     if (i.commandName === 'session_start'){
       await i.deferReply({ ephemeral: false });
       const plan = i.options.getString('plan') || '';
