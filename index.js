@@ -1,4 +1,4 @@
-// RLBR Lift Logger — clean checklist, modal plan paste, fast autocomplete
+// RLBR Lift Logger — modal plan paste, fast autocomplete, simple checklist (no filtering)
 
 import 'dotenv/config';
 import {
@@ -22,7 +22,7 @@ async function appPost(fn, body) {
   return await res.json();
 }
 
-/* -------- fallback exercise list (for safety) -------- */
+/* -------- fallback exercise list (for autocomplete) -------- */
 const FALLBACK_EXERCISES = [
   'Barbell Bench Press','Barbell Incline Bench Press','Dumbbell Bench Press','Dumbbell Incline Bench Press',
   'Machine Chest Press','Smith Machine Bench Press','Barbell Overhead Press','Seated Dumbbell Overhead Press',
@@ -36,18 +36,14 @@ const FALLBACK_EXERCISES = [
   'Weighted Back Extensions','Forward Neck Crunch','Neck Extension','Lateral Neck Crunch'
 ];
 
-/* ---------- exercise cache + canonical set ---------- */
 let EXERCISE_CACHE = { names: [], fetchedAt: 0 };
 
+/* ---------------- autocomplete cache ---------------- */
 function getCachedExercises() {
   return (EXERCISE_CACHE.names && EXERCISE_CACHE.names.length)
     ? EXERCISE_CACHE.names
     : FALLBACK_EXERCISES;
 }
-function getCanonicalSet() {
-  return new Set(getCachedExercises().map(n => String(n).trim()));
-}
-
 async function fetchWithTimeout(promise, ms = 2000) {
   return Promise.race([
     promise,
@@ -67,6 +63,16 @@ async function refreshExercises() {
   } catch {
     console.log('[cache] refresh failed/timeout — using fallback/current cache');
   }
+}
+
+/* ----------------- tiny sanitizer for names ----------------- */
+function sanitizeName(s) {
+  if (!s) return '';
+  let t = String(s).trim();
+  // If a header fragment ever leaks, strip it
+  t = t.replace(/===\s*BOT_MESSAGE_START\s*===.*?SETS:\s*/i, '');
+  t = t.replace(/\s{2,}/g, ' ');
+  return t;
 }
 
 /* -------------------- Slash commands -------------------- */
@@ -146,15 +152,11 @@ client.on('interactionCreate', async (i) => {
         const sid = out.session_id;
         client[sessionKey(i.channelId)] = sid;
 
-        // SHOW ONLY CANONICAL EXERCISES
-        const canon = getCanonicalSet();
-        const clean = (out.checklist || [])
-          .filter(c => c && c.exercise && canon.has(String(c.exercise).trim()));
-
-        const lines = clean.map((c, idx) => {
+        const lines = (out.checklist || []).map((c, idx) => {
+          const ex = sanitizeName(c.exercise);
           const tw = c.target_weight != null ? c.target_weight : '?';
           const tr = c.target_reps   != null ? c.target_reps   : '?';
-          return `${idx + 1}) ${String(c.exercise).trim()} — Target: ${tw}×${tr}`;
+          return `${idx + 1}) ${ex || '(unknown)'} — Target: ${tw}×${tr}`;
         });
         const msg = lines.length ? lines.join('\n') : 'No targets yet. Log freely.';
         return i.editReply(`🟢 Session started: \`${sid}\`\n🔥 SESSION CHECKLIST\n${msg}`);
@@ -191,15 +193,11 @@ client.on('interactionCreate', async (i) => {
       const sid = out.session_id;
       client[sessionKey(i.channelId)] = sid;
 
-      // SHOW ONLY CANONICAL EXERCISES
-      const canon = getCanonicalSet();
-      const clean = (out.checklist || [])
-        .filter(c => c && c.exercise && canon.has(String(c.exercise).trim()));
-
-      const lines = clean.map((c, idx) => {
+      const lines = (out.checklist || []).map((c, idx) => {
+        const ex = sanitizeName(c.exercise);
         const tw = c.target_weight != null ? c.target_weight : '?';
         const tr = c.target_reps   != null ? c.target_reps   : '?';
-        return `${idx + 1}) ${String(c.exercise).trim()} — Target: ${tw}×${tr}`;
+        return `${idx + 1}) ${ex || '(unknown)'} — Target: ${tw}×${tr}`;
       });
       const msg = lines.length ? lines.join('\n') : 'No targets yet. Log freely.';
       return i.editReply(`🟢 Session started: \`${sid}\`\n🔥 SESSION CHECKLIST\n${msg}`);
