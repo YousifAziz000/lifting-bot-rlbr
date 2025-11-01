@@ -1,18 +1,17 @@
-// index.js — RLBR Lift Logger (modal-based plan paste + fast autocomplete)
+// RLBR Lift Logger — clean checklist, modal plan paste, fast autocomplete
 
 import 'dotenv/config';
 import {
-  Client, GatewayIntentBits, REST, Routes,
-  SlashCommandBuilder,
+  Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
   ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder
 } from 'discord.js';
 
 const TOKEN      = process.env.DISCORD_TOKEN;
 const APP_URL    = process.env.APP_URL;        // Apps Script Web App /exec
 const APP_SECRET = process.env.APP_SECRET;     // same SECRET as in Apps Script
-const GUILD_ID   = process.env.GUILD_ID || ''; // optional: instant command registration
+const GUILD_ID   = process.env.GUILD_ID || ''; // optional: server ID for instant commands
 
-/* ---------------------- HTTP helper ---------------------- */
+/* -------------------- HTTP helper -------------------- */
 async function appPost(fn, body) {
   const url = `${APP_URL}?fn=${encodeURIComponent(fn)}&secret=${encodeURIComponent(APP_SECRET)}`;
   const res = await fetch(url, {
@@ -23,7 +22,7 @@ async function appPost(fn, body) {
   return await res.json();
 }
 
-/* --------- fallback (always-available) exercise list --------- */
+/* -------- fallback exercise list (for safety) -------- */
 const FALLBACK_EXERCISES = [
   'Barbell Bench Press','Barbell Incline Bench Press','Dumbbell Bench Press','Dumbbell Incline Bench Press',
   'Machine Chest Press','Smith Machine Bench Press','Barbell Overhead Press','Seated Dumbbell Overhead Press',
@@ -37,7 +36,7 @@ const FALLBACK_EXERCISES = [
   'Weighted Back Extensions','Forward Neck Crunch','Neck Extension','Lateral Neck Crunch'
 ];
 
-/* -------------- exercise cache for autocomplete ---------- */
+/* ---------- exercise cache + canonical set ---------- */
 let EXERCISE_CACHE = { names: [], fetchedAt: 0 };
 
 function getCachedExercises() {
@@ -45,7 +44,11 @@ function getCachedExercises() {
     ? EXERCISE_CACHE.names
     : FALLBACK_EXERCISES;
 }
-async function fetchWithTimeout(promise, ms = 1500) {
+function getCanonicalSet() {
+  return new Set(getCachedExercises().map(n => String(n).trim()));
+}
+
+async function fetchWithTimeout(promise, ms = 2000) {
   return Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
@@ -53,11 +56,13 @@ async function fetchWithTimeout(promise, ms = 1500) {
 }
 async function refreshExercises() {
   try {
-    const out = await fetchWithTimeout(appPost('list_exercises', {}), 1500);
+    const out = await fetchWithTimeout(appPost('list_exercises', {}), 2000);
     const list = (out && out.ok && Array.isArray(out.exercises)) ? out.exercises : [];
     if (list.length) {
       EXERCISE_CACHE = { names: list, fetchedAt: Date.now() };
       console.log(`[cache] loaded ${list.length} exercises from Sheets`);
+    } else {
+      console.log('[cache] empty/unchanged — using current cache');
     }
   } catch {
     console.log('[cache] refresh failed/timeout — using fallback/current cache');
@@ -68,10 +73,10 @@ async function refreshExercises() {
 const commands = [
   new SlashCommandBuilder()
     .setName('session_start')
-    .setDescription('Start a session (paste plan via modal if you leave plan empty)')
+    .setDescription('Start a session (leave plan empty to paste via modal)')
     .addStringOption(o =>
       o.setName('plan')
-       .setDescription('Optional: paste BOT_MESSAGE here (if short); otherwise leave empty to open a modal')
+       .setDescription('Optional: paste BOT_MESSAGE here if short; otherwise leave empty to open a modal')
        .setRequired(false)
     ),
 
@@ -131,7 +136,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    /* ---------------- Modal submission (plan paste) ---------------- */
+    /* ---------- Modal submission (multi-line plan) ---------- */
     if (i.isModalSubmit && i.isModalSubmit()) {
       if (i.customId === MODAL_ID) {
         await i.deferReply({ ephemeral: false });
@@ -141,10 +146,15 @@ client.on('interactionCreate', async (i) => {
         const sid = out.session_id;
         client[sessionKey(i.channelId)] = sid;
 
-        const lines = (out.checklist || []).map((c, idx) => {
+        // SHOW ONLY CANONICAL EXERCISES
+        const canon = getCanonicalSet();
+        const clean = (out.checklist || [])
+          .filter(c => c && c.exercise && canon.has(String(c.exercise).trim()));
+
+        const lines = clean.map((c, idx) => {
           const tw = c.target_weight != null ? c.target_weight : '?';
           const tr = c.target_reps   != null ? c.target_reps   : '?';
-          return `${idx + 1}) ${c.exercise} — Target: ${tw}×${tr}`;
+          return `${idx + 1}) ${String(c.exercise).trim()} — Target: ${tw}×${tr}`;
         });
         const msg = lines.length ? lines.join('\n') : 'No targets yet. Log freely.';
         return i.editReply(`🟢 Session started: \`${sid}\`\n🔥 SESSION CHECKLIST\n${msg}`);
@@ -158,8 +168,8 @@ client.on('interactionCreate', async (i) => {
     if (i.commandName === 'session_start') {
       const plan = i.options.getString('plan') || '';
 
-      // If user didn’t paste in the option, open a modal for multi-line paste (4000 chars)
       if (!plan.trim()) {
+        // open modal for long/multiline plan paste
         const modal = new ModalBuilder()
           .setCustomId(MODAL_ID)
           .setTitle('Paste your BOT_MESSAGE plan');
@@ -175,17 +185,21 @@ client.on('interactionCreate', async (i) => {
         return i.showModal(modal);
       }
 
-      // Short plan provided in option: try to use it directly
       await i.deferReply({ ephemeral: false });
       const out = await appPost('session_start', { maybe_plan_text: plan });
       if (!out.ok) return i.editReply(`❌ session_start error: ${out.error}`);
       const sid = out.session_id;
       client[sessionKey(i.channelId)] = sid;
 
-      const lines = (out.checklist || []).map((c, idx) => {
+      // SHOW ONLY CANONICAL EXERCISES
+      const canon = getCanonicalSet();
+      const clean = (out.checklist || [])
+        .filter(c => c && c.exercise && canon.has(String(c.exercise).trim()));
+
+      const lines = clean.map((c, idx) => {
         const tw = c.target_weight != null ? c.target_weight : '?';
         const tr = c.target_reps   != null ? c.target_reps   : '?';
-        return `${idx + 1}) ${c.exercise} — Target: ${tw}×${tr}`;
+        return `${idx + 1}) ${String(c.exercise).trim()} — Target: ${tw}×${tr}`;
       });
       const msg = lines.length ? lines.join('\n') : 'No targets yet. Log freely.';
       return i.editReply(`🟢 Session started: \`${sid}\`\n🔥 SESSION CHECKLIST\n${msg}`);
@@ -225,7 +239,7 @@ client.on('interactionCreate', async (i) => {
 
   } catch (err) {
     console.error(err);
-    if (i.isAutocomplete && i.isAutocomplete()) return; // don’t editReply for autocomplete
+    if (i.isAutocomplete && i.isAutocomplete()) return; // autocomplete replies can't be edited
     if (i.deferred) return i.editReply(`❌ Error: ${String(err)}`);
     return i.reply({ content: `❌ Error: ${String(err)}`, ephemeral: true });
   }
